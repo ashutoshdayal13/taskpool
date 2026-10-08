@@ -1,10 +1,12 @@
-// 10 tests, no framework. Run with:  make test   (also: make tsan / make asan)
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <future>
 #include <mutex>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,8 +42,6 @@ static void detached_tasks_all_run() {
     CHECK(n == 100'000);
 }
 
-// Tasks spawning tasks (binary tree, 2^16 leaves): exercises the
-// worker-local push + stealing.
 static void recursive_spawn_tree() {
     std::atomic<long> leaves{0};
     tp::thread_pool pool(8);
@@ -64,33 +64,32 @@ static void destructor_drains_queued_work() {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
                 ++ran;
             });
-    }  // destructor must finish all 500 before joining
+    }
     CHECK(ran == 500);
 }
 
 static void stealing_disabled_still_correct() {
     tp::thread_pool pool(4, /*stealing=*/false);
     std::atomic<int> n{0};
-    pool.submit([&] {   // spawn from inside one worker -> all in one deque
+    // Subtasks share one worker's deque when stealing is disabled.
+    pool.submit([&] {
         for (int i = 0; i < 10'000; ++i) pool.submit_detached([&] { ++n; });
     }).get();
     pool.wait_idle();
     CHECK(n == 10'000);
 
-    // Regression: let every worker fall asleep, THEN submit from outside.
-    // notify_one could wake a worker whose own deque is empty; with stealing
-    // off it would go back to sleep and the target worker would never wake.
+    // A sleeping pool must wake the task's owner when stealing is disabled.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     for (int i = 0; i < 8; ++i) {
         auto f = pool.submit([] { return 1; });
         CHECK(f.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));  // let them sleep again
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
 
 static void dag_respects_dependencies() {
     tp::thread_pool pool(4);
-    // Repeat: the source-scan/exec race only shows up on some interleavings.
+    // Repeat to catch duplicate submissions during the source scan.
     for (int rep = 0; rep < 2000; ++rep) {
         std::mutex mu;
         std::string order;
@@ -105,7 +104,6 @@ static void dag_respects_dependencies() {
         CHECK(order.size() == 4 && order.front() == 'a' && order.back() == 'd');
     }
 
-    // Fan-out / fan-in: sink must observe all 500 middles finished.
     tp::task_graph g2(pool);
     int src = g2.add([] {});
     std::atomic<int> mids{0};
@@ -129,8 +127,6 @@ static void parallel_for_matches_sequential() {
     CHECK(n == 3);
 }
 
-// parallel_for called from INSIDE a task on a 1-thread pool: the only
-// worker must help (run the chunks itself) instead of blocking -> no deadlock.
 static void nested_parallel_for_does_not_deadlock() {
     tp::thread_pool pool(1);
     std::atomic<long> sum{0};

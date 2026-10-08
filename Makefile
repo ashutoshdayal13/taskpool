@@ -1,4 +1,3 @@
-# make test | make tsan | make asan | make bench
 CXX      ?= g++
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Iinclude -pthread
 

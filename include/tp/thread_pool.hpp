@@ -8,23 +8,13 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace tp {
 
-// Work-stealing thread pool.
-//
-// THE WHOLE IDEA IN 4 LINES:
-//   1. Every worker has its OWN deque of tasks, guarded by its OWN mutex.
-//   2. A worker takes from the BACK of its own deque (LIFO: cache-warm work).
-//   3. If its deque is empty, it STEALS from the FRONT of another worker's
-//      deque (FIFO: the oldest / biggest chunk), using try_lock so it never
-//      blocks behind a busy owner.
-//   4. Idle workers sleep on a condition variable; submit() wakes one.
-//
-// Why not one shared queue?  Every thread would fight over one lock and one
-// cache line. Per-worker deques spread that contention N ways, and in steady
-// state each lock is touched only by its owner.
+// Workers pop from their own deque's back and steal from others' fronts.
 class thread_pool {
 public:
     explicit thread_pool(unsigned n = std::thread::hardware_concurrency(),
@@ -37,45 +27,42 @@ public:
     thread_pool(const thread_pool&) = delete;
     thread_pool& operator=(const thread_pool&) = delete;
 
-    // Stop accepting work, finish everything already queued, join.
     void shutdown() {
-        { std::lock_guard lk(cv_mu_); stop_ = true; }
+        {
+            std::lock_guard lock(cv_mu_);
+            stop_ = true;
+        }
         cv_.notify_all();
-        for (auto& t : threads_) if (t.joinable()) t.join();
+        for (auto& thread : threads_)
+            if (thread.joinable()) thread.join();
     }
 
-    // submit(f, args...) -> std::future<result>. Exceptions thrown by f are
-    // rethrown from future::get() (std::packaged_task does this for us).
     template <class F, class... Args>
     auto submit(F&& f, Args&&... args)
         -> std::future<std::invoke_result_t<F, Args...>> {
-        using R = std::invoke_result_t<F, Args...>;
-        // packaged_task is move-only, std::function needs copyable:
-        // wrap it in a shared_ptr. (Classic thread-pool interview question.)
-        auto pt = std::make_shared<std::packaged_task<R()>>(
+        using result_type = std::invoke_result_t<F, Args...>;
+        // std::function needs a copyable wrapper for the move-only packaged task.
+        auto packaged = std::make_shared<std::packaged_task<result_type()>>(
             [f = std::forward<F>(f), ... args = std::forward<Args>(args)]() mutable {
                 return f(args...);
             });
-        auto fut = pt->get_future();
-        enqueue([pt] { (*pt)(); });
-        return fut;
+        auto future = packaged->get_future();
+        enqueue([packaged] { (*packaged)(); });
+        return future;
     }
 
-    // Fire-and-forget: no future, cheaper. f must not throw.
+    // Detached tasks must not throw.
     void submit_detached(std::function<void()> f) { enqueue(std::move(f)); }
 
-    // Block until every submitted task has finished.
     void wait_idle() {
         std::unique_lock lk(cv_mu_);
         idle_cv_.wait(lk, [&] { return pending_ == 0; });
     }
 
-    // Run queued tasks on THIS thread until pred() is true. This is how a
-    // task can wait for its own subtasks without deadlocking the pool: the
-    // waiting worker keeps working instead of blocking.
+    // Run tasks while waiting so nested parallel work cannot deadlock the pool.
     template <class Pred>
     void help_while(Pred pred) {
-        int me = (tls_pool_ == this) ? tls_index_ : -1;
+        const int me = tls_pool_ == this ? tls_index_ : -1;
         while (!pred()) {
             if (auto t = try_get(me)) run(std::move(t));
             else std::this_thread::yield();
@@ -83,33 +70,31 @@ public:
     }
 
     unsigned size() const { return static_cast<unsigned>(workers_.size()); }
-    static thread_pool* current() { return tls_pool_; }        // nullptr if not a worker
+    static thread_pool* current() { return tls_pool_; }
     static int current_worker() { return tls_pool_ ? tls_index_ : -1; }
 
 private:
     using task = std::function<void()>;
 
-    struct alignas(64) worker {   // alignas: no false sharing between workers
-        std::mutex mu;
-        std::deque<task> q;       // owner pops BACK, thieves pop FRONT
-        std::atomic<long> size{0};  // q.size(), readable without the mutex
+    // Keep workers on separate cache lines.
+    struct alignas(64) worker {
+        std::mutex mutex;
+        std::deque<task> queue;
+        std::atomic<long> queued{0};
     };
 
     std::vector<worker> workers_;
     std::vector<std::thread> threads_;
     bool stealing_;
-    std::atomic<unsigned> rr_{0};       // round-robin target for outside submits
+    std::atomic<unsigned> next_worker_{0};
 
     std::mutex cv_mu_;
     std::condition_variable cv_, idle_cv_;
-    bool stop_ = false;                 // guarded by cv_mu_
-    std::atomic<int> sleepers_{0};      // workers currently blocked on cv_
-    std::atomic<int> spinning_{0};      // workers awake and scanning for work
-    // The one global per-task counter. It is the throughput ceiling for
-    // near-empty tasks (two contended atomic RMWs per task from every
-    // core); it lives on its own cache line so it at least doesn't drag
-    // the mutex or sleepers_ along. Per-deque counts live in worker::size.
-    alignas(64) std::atomic<long> pending_{0};   // submitted, not yet finished
+    bool stop_ = false;  // guarded by cv_mu_
+    std::atomic<int> sleepers_{0};
+    std::atomic<int> spinning_{0};
+    // Isolate the shared task count from the sleep/wake state.
+    alignas(64) std::atomic<long> pending_{0};
 
     inline static thread_local thread_pool* tls_pool_ = nullptr;
     inline static thread_local int tls_index_ = -1;
@@ -119,77 +104,62 @@ private:
             std::lock_guard lk(cv_mu_);
             if (stop_) throw std::runtime_error("thread_pool: submit after shutdown");
         }
-        // From a worker: push to its OWN deque. From outside: round-robin.
-        unsigned i = (tls_pool_ == this) ? static_cast<unsigned>(tls_index_)
-                                         : rr_++ % workers_.size();
+        const unsigned i = tls_pool_ == this ? static_cast<unsigned>(tls_index_)
+                                             : next_worker_++ % workers_.size();
+        auto& worker = workers_[i];
         pending_++;
-        workers_[i].size++;   // before the push: the count may briefly exceed
-                              // the deque, never undercount it
+        // Publish the count first so a worker preparing to sleep sees the task.
+        worker.queued++;
         {
-            std::lock_guard lk(workers_[i].mu);
-            workers_[i].q.push_back(std::move(t));
+            std::lock_guard lock(worker.mutex);
+            worker.queue.push_back(std::move(t));
         }
-        // Wake a worker only if (a) some worker is actually asleep AND
-        // (b) no worker is already awake and scanning -- a spinner will
-        // find this task on its own, and waking more threads per submit
-        // just creates a herd fighting over one mutex (measured: ~17 us per
-        // submit on a 16-thread machine without this check).
-        // Correctness: sleepers_++ (worker) and size++ (here) are both
-        // seq_cst, so at least one side sees the other's write -- either we
-        // see a sleeper and notify (under cv_mu_, so it is provably asleep),
-        // or the worker sees size > 0 and doesn't sleep. A spinner
-        // re-checks the sizes under cv_mu_ before it may sleep, so skipping
-        // the notify because of it can't strand the task.
-        // With stealing OFF, a spinner can't take another worker's task, so
-        // the spinner shortcut doesn't apply there.
+        // A scanning worker will find the task if stealing is enabled.
+        // Sequentially consistent counts and the locked sleep check prevent lost wakeups.
         if (sleepers_.load() > 0 && (!stealing_ || spinning_.load() == 0)) {
             std::lock_guard lk(cv_mu_);
-            // With stealing ON, any woken worker can take the task, so one
-            // wakeup is enough. With stealing OFF only the target worker
-            // can run it -- notify_one might wake the wrong worker, which
-            // would recheck its own (empty) deque and sleep again while the
-            // right one stays asleep forever. So wake them all.
+            // Without stealing, notify_all ensures the task's owner wakes up.
             if (stealing_) cv_.notify_one(); else cv_.notify_all();
         }
     }
 
     static task pop_back(worker& w) {
-        std::lock_guard lk(w.mu);
-        if (w.q.empty()) return nullptr;
-        task t = std::move(w.q.back());
-        w.q.pop_back();
-        w.size--;
+        std::lock_guard lock(w.mutex);
+        if (w.queue.empty()) return {};
+        task t = std::move(w.queue.back());
+        w.queue.pop_back();
+        w.queued--;
         return t;
     }
     static task steal_front(worker& w) {
-        std::unique_lock lk(w.mu, std::try_to_lock);   // busy? move on, don't wait
-        if (!lk || w.q.empty()) return nullptr;
-        task t = std::move(w.q.front());
-        w.q.pop_front();
-        w.size--;
+        std::unique_lock lock(w.mutex, std::try_to_lock);
+        if (!lock || w.queue.empty()) return {};
+        task t = std::move(w.queue.front());
+        w.queue.pop_front();
+        w.queued--;
         return t;
     }
 
-    // Own deque first, then steal from the others (starting at a neighbour).
     task try_get(int me) {
-        task t;
-        if (me >= 0) t = pop_back(workers_[static_cast<size_t>(me)]);
-        if (!t && (stealing_ || me < 0)) {
-            unsigned n = static_cast<unsigned>(workers_.size());
-            unsigned start = me >= 0 ? static_cast<unsigned>(me) + 1 : rr_.load();
-            for (unsigned k = 0; k < n && !t; ++k) {
-                unsigned v = (start + k) % n;
-                if (static_cast<int>(v) != me) t = steal_front(workers_[v]);
-            }
+        if (me >= 0) {
+            if (auto t = pop_back(workers_[static_cast<size_t>(me)])) return t;
+            if (!stealing_) return {};
         }
-        return t;
+
+        const unsigned n = size();
+        const unsigned start = me >= 0 ? static_cast<unsigned>(me) + 1 : next_worker_.load();
+        for (unsigned k = 0; k < n; ++k) {
+            const unsigned victim = (start + k) % n;
+            if (static_cast<int>(victim) == me) continue;
+            if (auto t = steal_front(workers_[victim])) return t;
+        }
+        return {};
     }
 
-    // Sleep-predicate check: with stealing, any deque counts; without it,
-    // only my own. Only runs on the (rare) about-to-sleep path.
     bool work_available(int me) {
-        if (!stealing_) return workers_[static_cast<size_t>(me)].size > 0;
-        for (auto& w : workers_) if (w.size > 0) return true;
+        if (!stealing_) return workers_[static_cast<size_t>(me)].queued > 0;
+        for (auto& w : workers_)
+            if (w.queued > 0) return true;
         return false;
     }
 
@@ -206,20 +176,21 @@ private:
         tls_index_ = static_cast<int>(me);
         const int m = static_cast<int>(me);
         for (;;) {
-            // Spin briefly before sleeping: under steady load the next task
-            // arrives within microseconds, and a futex sleep/wake costs far
-            // more than a few failed scans.
+            // Briefly spin to avoid a sleep/wake cycle for short gaps in work.
             task t;
             spinning_++;
             for (int spin = 0; spin < 64 && !t; ++spin) t = try_get(m);
             spinning_--;
-            if (t) { run(std::move(t)); continue; }
+            if (t) {
+                run(std::move(t));
+                continue;
+            }
 
             std::unique_lock lk(cv_mu_);
             sleepers_++;
             cv_.wait(lk, [&] { return stop_ || work_available(m); });
             sleepers_--;
-            if (stop_ && !work_available(m)) break;   // drained
+            if (stop_ && !work_available(m)) break;
         }
     }
 };

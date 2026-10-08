@@ -8,40 +8,27 @@
 
 namespace tp {
 
-// Task DAG on top of the pool.
-//
-//   tp::task_graph g(pool);
-//   int a = g.add(load);
-//   int b = g.add(transform, {a});      // runs after a
-//   int c = g.add(validate,  {a});
-//   g.add(publish, {b, c});             // runs after b AND c
-//   g.run_and_wait();
-//
-// How: each node counts its unfinished predecessors (atomic). When a node
-// finishes it decrements each successor's count; whoever hits zero submits
-// that successor. No locks at runtime -- edges are fixed before run.
-// Nodes must not throw.
+// Tasks run after their dependencies finish. Task functions must not throw.
 class task_graph {
 public:
-    explicit task_graph(thread_pool& p) : pool_(p) {}
+    explicit task_graph(thread_pool& pool) : pool_(pool) {}
 
     int add(std::function<void()> f, std::vector<int> deps = {}) {
-        int id = static_cast<int>(nodes_.size());
-        auto n = std::make_unique<node>();
-        n->fn = std::move(f);
-        n->waiting = static_cast<int>(deps.size());
-        for (int d : deps) nodes_[static_cast<size_t>(d)]->succ.push_back(id);
-        nodes_.push_back(std::move(n));
+        const int id = static_cast<int>(nodes_.size());
+        auto entry = std::make_unique<node>();
+        entry->fn = std::move(f);
+        entry->waiting = static_cast<int>(deps.size());
+        for (int dependency : deps)
+            nodes_[static_cast<size_t>(dependency)]->successors.push_back(id);
+        nodes_.push_back(std::move(entry));
         return id;
     }
 
-    // Call once, after all add()s. Blocks (helping the pool) until done.
+    // Call once, after adding all nodes.
     void run_and_wait() {
         remaining_ = static_cast<long>(nodes_.size());
-        // Find ALL sources first, THEN submit. If we submitted while
-        // scanning, an already-running source could finish, decrement a
-        // successor to 0 and submit it -- and our scan would then see that
-        // successor's count == 0 and submit it a second time.
+        // Collect sources before submitting; running tasks can release successors
+        // during the scan and cause them to be submitted twice.
         std::vector<int> sources;
         for (int i = 0; i < static_cast<int>(nodes_.size()); ++i)
             if (nodes_[static_cast<size_t>(i)]->waiting == 0) sources.push_back(i);
@@ -52,19 +39,19 @@ public:
 private:
     struct node {
         std::function<void()> fn;
-        std::atomic<int> waiting{0};   // unfinished predecessors
-        std::vector<int> succ;         // successors, fixed before run
+        std::atomic<int> waiting{0};
+        std::vector<int> successors;
     };
     thread_pool& pool_;
     std::vector<std::unique_ptr<node>> nodes_;
     std::atomic<long> remaining_{0};
 
     void exec(int i) {
-        node& n = *nodes_[static_cast<size_t>(i)];
-        n.fn();
-        for (int s : n.succ)
-            if (--nodes_[static_cast<size_t>(s)]->waiting == 0)
-                pool_.submit_detached([this, s] { exec(s); });
+        node& entry = *nodes_[static_cast<size_t>(i)];
+        entry.fn();
+        for (int successor : entry.successors)
+            if (--nodes_[static_cast<size_t>(successor)]->waiting == 0)
+                pool_.submit_detached([this, successor] { exec(successor); });
         --remaining_;
     }
 };
