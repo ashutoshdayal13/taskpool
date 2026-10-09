@@ -85,7 +85,7 @@ static void external_throughput(unsigned hw) {
 }
 
 static void work_stealing(unsigned hw) {
-    std::printf("\nB. work stealing, skewed load: 20000 x ~5us tasks, all spawned inside worker 0\n");
+    std::printf("\nB. work stealing, skewed load: 20000 x ~5us tasks, all spawned inside one worker\n");
     for (int rep = 0; rep < 2; ++rep) {
         for (bool stealing : {false, true}) {
             const long T = 20'000;

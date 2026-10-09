@@ -1,0 +1,40 @@
+g++ -std=c++20 -O2 -Wall -Wextra -Iinclude -pthread bench/bench.cpp -o bench_bin && ./bench_bin
+hardware threads: 16
+
+A1. tasks spawned inside workers, task body ~0 us
+    1 threads:   10063675 tasks/sec  (99 ns/task)  1.00x vs 1 thread
+    2 threads:    4844231 tasks/sec  (206 ns/task)  0.48x vs 1 thread
+    4 threads:    3781109 tasks/sec  (264 ns/task)  0.38x vs 1 thread
+    8 threads:    3067875 tasks/sec  (326 ns/task)  0.30x vs 1 thread
+   16 threads:    1775815 tasks/sec  (563 ns/task)  0.18x vs 1 thread
+
+A1. tasks spawned inside workers, task body ~1 us
+    1 threads:    1232319 tasks/sec  (811 ns/task)  1.00x vs 1 thread
+    2 threads:    1878564 tasks/sec  (532 ns/task)  1.52x vs 1 thread
+    4 threads:    2582786 tasks/sec  (387 ns/task)  2.10x vs 1 thread
+    8 threads:    2737592 tasks/sec  (365 ns/task)  2.22x vs 1 thread
+   16 threads:    2264014 tasks/sec  (442 ns/task)  1.84x vs 1 thread
+
+A1. tasks spawned inside workers, task body ~10 us
+    1 threads:     131387 tasks/sec  (7611 ns/task)  1.00x vs 1 thread
+    2 threads:     255183 tasks/sec  (3919 ns/task)  1.94x vs 1 thread
+    4 threads:     478313 tasks/sec  (2091 ns/task)  3.64x vs 1 thread
+    8 threads:     747685 tasks/sec  (1337 ns/task)  5.69x vs 1 thread
+   16 threads:     841782 tasks/sec  (1188 ns/task)  6.41x vs 1 thread
+
+A2. single external producer (main thread submitting one task at a time)
+   16 threads:      91825 tasks/sec  (10890 ns/task, submit-bound)
+   std::async (thread per task): 25838 tasks/sec
+
+B. work stealing, skewed load: 20000 x ~5us tasks, all spawned inside one worker
+   stealing OFF  makespan    73.8 ms   start-latency p50   36.63 ms  p99   72.95 ms
+   stealing ON   makespan   218.3 ms   start-latency p50    0.01 ms  p99    0.02 ms
+   stealing OFF  makespan    74.1 ms   start-latency p50   38.48 ms  p99   73.31 ms
+   stealing ON   makespan   215.8 ms   start-latency p50    0.01 ms  p99    0.02 ms
+
+C. parallel_for, sum of sin(i), N = 8M
+   sequential          66.0 ms
+   parallel_for         7.4 ms   speedup  8.95x   grain=auto (N / 8*threads)
+   parallel_for      5367.8 ms   speedup  0.01x   grain=16 (500k tasks: overhead dominates)
+   parallel_for        25.6 ms   speedup  2.57x   grain=4096
+   parallel_for        31.3 ms   speedup  2.11x   grain=N/2 (2 tasks: no load balance)
